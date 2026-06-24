@@ -20,34 +20,53 @@ def load_dtr(input_path: Path) -> pd.DataFrame:
     return df
 
 
+def is_blank(value) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return value is None
+
+
 def parse_dtr_datetime(date_value, time_value):
-    if pd.isna(date_value) or pd.isna(time_value):
-        return pd.NaT
-
-    date_part = pd.to_datetime(date_value, errors="coerce")
-    if pd.isna(date_part):
-        return pd.NaT
-    date_part = date_part.date()
-
-    if isinstance(time_value, time):
-        time_part = time_value
-    elif isinstance(time_value, datetime):
-        time_part = time_value.time()
-    elif isinstance(time_value, pd.Timestamp):
-        time_part = time_value.time()
-    elif isinstance(time_value, (int, float)):
-        seconds = round(float(time_value) * 86400) % 86400
-        time_part = (datetime.min + timedelta(seconds=seconds)).time()
-    else:
-        text_value = str(time_value).strip()
-        if text_value.lower() in {"", "nan", "nat", "none", "null"}:
+    try:
+        if is_blank(date_value) or is_blank(time_value):
             return pd.NaT
-        parsed_time = pd.to_datetime(text_value, errors="coerce")
-        if pd.isna(parsed_time):
-            return pd.NaT
-        time_part = parsed_time.time()
 
-    return pd.Timestamp(datetime.combine(date_part, time_part))
+        date_part = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(date_part):
+            return pd.NaT
+        date_part = date_part.date()
+
+        if isinstance(time_value, pd.Timestamp):
+            time_part = time_value.time()
+        elif isinstance(time_value, datetime):
+            time_part = time_value.time()
+        elif isinstance(time_value, time):
+            time_part = time_value
+        elif isinstance(time_value, (int, float)):
+            numeric_time = float(time_value)
+            if numeric_time < 0:
+                return pd.NaT
+            if numeric_time >= 1:
+                parsed = pd.to_datetime(time_value, errors="coerce")
+                if pd.isna(parsed):
+                    return pd.NaT
+                time_part = parsed.time()
+            else:
+                seconds = round(numeric_time * 86400) % 86400
+                time_part = (datetime.min + timedelta(seconds=seconds)).time()
+        else:
+            text_value = str(time_value).strip()
+            if text_value.lower() in {"", "nan", "nat", "none", "null", "-"}:
+                return pd.NaT
+            parsed_time = pd.to_datetime(text_value, errors="coerce")
+            if pd.isna(parsed_time):
+                return pd.NaT
+            time_part = parsed_time.time()
+
+        return pd.Timestamp(datetime.combine(date_part, time_part))
+    except Exception:
+        return pd.NaT
 
 
 def clean_raw_logs(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,10 +152,14 @@ def export_cleaned_data(raw: pd.DataFrame, summary: pd.DataFrame, output_dir: Pa
     punches_export.to_csv(punches_csv, index=False)
     summary.to_csv(summary_csv, index=False)
 
+    summary_excel = summary.astype(object).where(pd.notna(summary), "")
+    punches_excel = punches_export.astype(object).where(pd.notna(punches_export), "")
+    raw_excel = raw_export.astype(object).where(pd.notna(raw_export), "")
+
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
-        summary.to_excel(writer, index=False, sheet_name="Time In Time Out")
-        punches_export.to_excel(writer, index=False, sheet_name="Punch Logs")
-        raw_export.to_excel(writer, index=False, sheet_name="Raw Logs")
+        summary_excel.to_excel(writer, index=False, sheet_name="Time In Time Out")
+        punches_excel.to_excel(writer, index=False, sheet_name="Punch Logs")
+        raw_excel.to_excel(writer, index=False, sheet_name="Raw Logs")
 
     print("DTR processing complete.")
     print(f"Raw logs exported: {raw_csv}")
