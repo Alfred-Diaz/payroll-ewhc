@@ -42,15 +42,47 @@ def clean_raw_logs(df: pd.DataFrame) -> pd.DataFrame:
     return raw
 
 
+def build_punch_logs(raw: pd.DataFrame) -> pd.DataFrame:
+    """Convert TIME IN and TIME OUT columns into one reliable punch stream.
+
+    Some biometric exports place valid punches inconsistently: a row may have only
+    TIME IN, only TIME OUT, or both. Payroll needs the earliest and latest punch
+    from either column, not just the min of TIME IN and max of TIME OUT separately.
+    """
+
+    id_columns = ["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"]
+
+    time_in_punches = raw[id_columns + ["TIME IN"]].rename(columns={"TIME IN": "PUNCH_TIME"})
+    time_in_punches["PUNCH_SOURCE"] = "TIME IN"
+
+    time_out_punches = raw[id_columns + ["TIME OUT"]].rename(columns={"TIME OUT": "PUNCH_TIME"})
+    time_out_punches["PUNCH_SOURCE"] = "TIME OUT"
+
+    punches = pd.concat([time_in_punches, time_out_punches], ignore_index=True)
+    punches = punches.dropna(subset=["PUNCH_TIME"])
+    punches = punches.sort_values(["EMPLOYEE CODE", "DATE", "PUNCH_TIME"])
+
+    return punches
+
+
 def normalize_time_in_out(raw: pd.DataFrame) -> pd.DataFrame:
-    grouped = raw.groupby(["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], dropna=False)
+    punches = build_punch_logs(raw)
+
+    grouped = punches.groupby(["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], dropna=False)
 
     summary = grouped.agg(
-        FIRST_IN=("TIME IN", "min"),
-        LAST_OUT=("TIME OUT", "max"),
-        RAW_LOG_COUNT=("EMPLOYEE CODE", "count"),
+        FIRST_IN=("PUNCH_TIME", "min"),
+        LAST_OUT=("PUNCH_TIME", "max"),
+        VALID_PUNCH_COUNT=("PUNCH_TIME", "count"),
     ).reset_index()
 
+    raw_counts = (
+        raw.groupby(["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], dropna=False)
+        .size()
+        .reset_index(name="RAW_ROW_COUNT")
+    )
+
+    summary = summary.merge(raw_counts, on=["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], how="left")
     summary = summary.sort_values(["EMPLOYEE CODE", "DATE"])
 
     summary["FIRST_IN"] = pd.to_datetime(summary["FIRST_IN"], errors="coerce")
@@ -59,13 +91,17 @@ def normalize_time_in_out(raw: pd.DataFrame) -> pd.DataFrame:
     summary["FIRST_IN_TIME"] = summary["FIRST_IN"].dt.strftime("%H:%M:%S")
     summary["LAST_OUT_TIME"] = summary["LAST_OUT"].dt.strftime("%H:%M:%S")
 
+    summary["HAS_MISSING_TIME"] = summary["FIRST_IN_TIME"].isna() | summary["LAST_OUT_TIME"].isna()
+
     export_columns = [
         "EMPLOYEE CODE",
         "EMPLOYEE NAME",
         "DATE",
         "FIRST_IN_TIME",
         "LAST_OUT_TIME",
-        "RAW_LOG_COUNT",
+        "VALID_PUNCH_COUNT",
+        "RAW_ROW_COUNT",
+        "HAS_MISSING_TIME",
     ]
 
     return summary[export_columns]
@@ -78,22 +114,31 @@ def export_cleaned_data(raw: pd.DataFrame, summary: pd.DataFrame, output_dir: Pa
     raw_export["TIME IN"] = raw_export["TIME IN"].dt.strftime("%Y-%m-%d %H:%M:%S")
     raw_export["TIME OUT"] = raw_export["TIME OUT"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    punches = build_punch_logs(raw)
+    punches_export = punches.copy()
+    punches_export["PUNCH_TIME"] = punches_export["PUNCH_TIME"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
     raw_csv = output_dir / "raw_biometric_logs.csv"
+    punches_csv = output_dir / "normalized_punch_logs.csv"
     summary_csv = output_dir / "attendance_time_in_out.csv"
     summary_xlsx = output_dir / "attendance_time_in_out.xlsx"
 
     raw_export.to_csv(raw_csv, index=False)
+    punches_export.to_csv(punches_csv, index=False)
     summary.to_csv(summary_csv, index=False)
 
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="Time In Time Out")
+        punches_export.to_excel(writer, index=False, sheet_name="Punch Logs")
         raw_export.to_excel(writer, index=False, sheet_name="Raw Logs")
 
     print("DTR processing complete.")
     print(f"Raw logs exported: {raw_csv}")
+    print(f"Normalized punch logs exported: {punches_csv}")
     print(f"Clean summary CSV exported: {summary_csv}")
     print(f"Clean summary Excel exported: {summary_xlsx}")
     print(f"Raw rows: {len(raw_export)}")
+    print(f"Valid punches: {len(punches_export)}")
     print(f"Clean attendance rows: {len(summary)}")
     print(f"Employees: {summary['EMPLOYEE CODE'].nunique()}")
 
