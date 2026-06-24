@@ -11,7 +11,7 @@ from src.attendance.process_dtr import clean_raw_logs, load_dtr, normalize_time_
 UPLOAD_DIR = Path("imports")
 EXPORT_DIR = Path("exports")
 
-st.set_page_config(page_title="EWHC Payroll DTR Portal", page_icon="🕒", layout="wide")
+st.set_page_config(page_title="EWHC Payroll DTR Portal", layout="wide")
 
 st.title("EWHC Payroll DTR Upload Portal")
 st.caption("Upload biometric DTR files and extract clean Time In / Time Out attendance data.")
@@ -58,18 +58,43 @@ with pd.ExcelWriter(summary_xlsx_path, engine="openpyxl") as writer:
 
 st.success("DTR processed successfully.")
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Raw logs", f"{len(raw_export):,}")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Raw rows", f"{len(raw_export):,}")
 col2.metric("Clean attendance rows", f"{len(summary):,}")
 col3.metric("Employees", f"{summary['EMPLOYEE CODE'].nunique():,}")
 
+if "DURATION_HOURS" in summary.columns:
+    total_hours = summary["DURATION_HOURS"].fillna(0).sum()
+    col4.metric("Total tracked hours", f"{total_hours:,.2f}")
+else:
+    col4.metric("Total tracked hours", "N/A")
+
 st.subheader("Basic log chart")
-chart_data = (
-    summary.groupby("DATE", as_index=False)["RAW_LOG_COUNT"]
-    .sum()
-    .rename(columns={"DATE": "Date", "RAW_LOG_COUNT": "Raw log count"})
-)
-st.bar_chart(chart_data, x="Date", y="Raw log count")
+if "VALID_PUNCH_COUNT" in summary.columns:
+    log_count_column = "VALID_PUNCH_COUNT"
+elif "RAW_ROW_COUNT" in summary.columns:
+    log_count_column = "RAW_ROW_COUNT"
+else:
+    log_count_column = None
+
+if log_count_column:
+    chart_data = (
+        summary.groupby("DATE", as_index=False)[log_count_column]
+        .sum()
+        .rename(columns={"DATE": "Date", log_count_column: "Log count"})
+    )
+    st.bar_chart(chart_data, x="Date", y="Log count")
+else:
+    st.warning("No log count column found for charting.")
+
+if "DURATION_HOURS" in summary.columns:
+    st.subheader("Tracked hours by date")
+    hours_chart_data = (
+        summary.groupby("DATE", as_index=False)["DURATION_HOURS"]
+        .sum()
+        .rename(columns={"DATE": "Date", "DURATION_HOURS": "Tracked hours"})
+    )
+    st.bar_chart(hours_chart_data, x="Date", y="Tracked hours")
 
 st.subheader("Clean Time In / Time Out Preview")
 st.dataframe(summary, use_container_width=True)
