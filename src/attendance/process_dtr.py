@@ -5,117 +5,89 @@ from pathlib import Path
 
 import pandas as pd
 
-REQUIRED_COLUMNS = [
-    "EMPLOYEE CODE",
-    "EMPLOYEE NAME",
-    "DATE",
-    "TIME IN",
-    "TIME OUT",
-]
+REQUIRED_COLUMNS = ["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE", "TIME IN", "TIME OUT"]
 
 
 def load_dtr(input_path: Path) -> pd.DataFrame:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
-
     df = pd.read_excel(input_path)
     df.columns = [str(column).strip().upper() for column in df.columns]
-
-    missing_columns = [column for column in REQUIRED_COLUMNS if column not in df.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {missing_columns}")
-
+    missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
     return df
 
 
 def clean_raw_logs(df: pd.DataFrame) -> pd.DataFrame:
     raw = df.copy()
-
     raw["EMPLOYEE CODE"] = raw["EMPLOYEE CODE"].astype(str).str.strip()
     raw["EMPLOYEE NAME"] = raw["EMPLOYEE NAME"].astype(str).str.strip()
     raw["DATE"] = pd.to_datetime(raw["DATE"], errors="coerce").dt.date
-
     raw["TIME IN"] = pd.to_datetime(raw["TIME IN"], errors="coerce")
     raw["TIME OUT"] = pd.to_datetime(raw["TIME OUT"], errors="coerce")
-
-    raw = raw.dropna(subset=["EMPLOYEE CODE", "DATE"])
-    return raw
+    return raw.dropna(subset=["EMPLOYEE CODE", "DATE"])
 
 
 def build_punch_logs(raw: pd.DataFrame) -> pd.DataFrame:
-    """Convert TIME IN and TIME OUT columns into one reliable punch stream.
-
-    Some biometric exports place valid punches inconsistently: a row may have only
-    TIME IN, only TIME OUT, or both. Payroll needs the earliest and latest punch
-    from either column, not just the min of TIME IN and max of TIME OUT separately.
-    """
-
-    id_columns = ["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"]
-
-    time_in_punches = raw[id_columns + ["TIME IN"]].rename(columns={"TIME IN": "PUNCH_TIME"})
-    time_in_punches["PUNCH_SOURCE"] = "TIME IN"
-
-    time_out_punches = raw[id_columns + ["TIME OUT"]].rename(columns={"TIME OUT": "PUNCH_TIME"})
-    time_out_punches["PUNCH_SOURCE"] = "TIME OUT"
-
-    punches = pd.concat([time_in_punches, time_out_punches], ignore_index=True)
+    id_cols = ["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"]
+    in_rows = raw[id_cols + ["TIME IN"]].rename(columns={"TIME IN": "PUNCH_TIME"})
+    in_rows["PUNCH_SOURCE"] = "TIME IN"
+    out_rows = raw[id_cols + ["TIME OUT"]].rename(columns={"TIME OUT": "PUNCH_TIME"})
+    out_rows["PUNCH_SOURCE"] = "TIME OUT"
+    punches = pd.concat([in_rows, out_rows], ignore_index=True)
     punches = punches.dropna(subset=["PUNCH_TIME"])
-    punches = punches.sort_values(["EMPLOYEE CODE", "DATE", "PUNCH_TIME"])
+    return punches.sort_values(["EMPLOYEE CODE", "DATE", "PUNCH_TIME"])
 
-    return punches
+
+def minutes_to_hhmm(minutes_value) -> str:
+    if pd.isna(minutes_value):
+        return ""
+    minutes_value = int(minutes_value)
+    return f"{minutes_value // 60:02d}:{minutes_value % 60:02d}"
 
 
 def normalize_time_in_out(raw: pd.DataFrame) -> pd.DataFrame:
     punches = build_punch_logs(raw)
+    keys = ["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"]
 
-    grouped = punches.groupby(["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], dropna=False)
-
-    summary = grouped.agg(
+    summary = punches.groupby(keys, dropna=False).agg(
         FIRST_IN=("PUNCH_TIME", "min"),
         LAST_OUT=("PUNCH_TIME", "max"),
         VALID_PUNCH_COUNT=("PUNCH_TIME", "count"),
     ).reset_index()
 
-    raw_counts = (
-        raw.groupby(["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], dropna=False)
-        .size()
-        .reset_index(name="RAW_ROW_COUNT")
-    )
-
-    summary = summary.merge(raw_counts, on=["EMPLOYEE CODE", "EMPLOYEE NAME", "DATE"], how="left")
+    raw_counts = raw.groupby(keys, dropna=False).size().reset_index(name="RAW_ROW_COUNT")
+    summary = summary.merge(raw_counts, on=keys, how="left")
     summary = summary.sort_values(["EMPLOYEE CODE", "DATE"])
 
     summary["FIRST_IN"] = pd.to_datetime(summary["FIRST_IN"], errors="coerce")
     summary["LAST_OUT"] = pd.to_datetime(summary["LAST_OUT"], errors="coerce")
-
     summary["FIRST_IN_TIME"] = summary["FIRST_IN"].dt.strftime("%H:%M:%S")
     summary["LAST_OUT_TIME"] = summary["LAST_OUT"].dt.strftime("%H:%M:%S")
 
+    summary["DURATION_MINUTES"] = ((summary["LAST_OUT"] - summary["FIRST_IN"]).dt.total_seconds() / 60).round()
+    summary.loc[summary["DURATION_MINUTES"] < 0, "DURATION_MINUTES"] = pd.NA
+    summary["DURATION_MINUTES"] = summary["DURATION_MINUTES"].astype("Int64")
+    summary["DURATION_HOURS"] = (summary["DURATION_MINUTES"] / 60).round(2)
+    summary["DURATION_HHMM"] = summary["DURATION_MINUTES"].apply(minutes_to_hhmm)
     summary["HAS_MISSING_TIME"] = summary["FIRST_IN_TIME"].isna() | summary["LAST_OUT_TIME"].isna()
 
-    export_columns = [
-        "EMPLOYEE CODE",
-        "EMPLOYEE NAME",
-        "DATE",
-        "FIRST_IN_TIME",
-        "LAST_OUT_TIME",
-        "VALID_PUNCH_COUNT",
-        "RAW_ROW_COUNT",
-        "HAS_MISSING_TIME",
-    ]
-
-    return summary[export_columns]
+    return summary[[
+        "EMPLOYEE CODE", "EMPLOYEE NAME", "DATE",
+        "FIRST_IN_TIME", "LAST_OUT_TIME",
+        "DURATION_HHMM", "DURATION_HOURS", "DURATION_MINUTES",
+        "VALID_PUNCH_COUNT", "RAW_ROW_COUNT", "HAS_MISSING_TIME",
+    ]]
 
 
 def export_cleaned_data(raw: pd.DataFrame, summary: pd.DataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-
     raw_export = raw.copy()
     raw_export["TIME IN"] = raw_export["TIME IN"].dt.strftime("%Y-%m-%d %H:%M:%S")
     raw_export["TIME OUT"] = raw_export["TIME OUT"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    punches = build_punch_logs(raw)
-    punches_export = punches.copy()
+    punches_export = build_punch_logs(raw).copy()
     punches_export["PUNCH_TIME"] = punches_export["PUNCH_TIME"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
     raw_csv = output_dir / "raw_biometric_logs.csv"
@@ -155,7 +127,6 @@ def main() -> None:
     parser.add_argument("input", help="Path to the DTR Excel file.")
     parser.add_argument("--output", default="exports", help="Output folder. Default: exports")
     args = parser.parse_args()
-
     process_dtr(Path(args.input), Path(args.output))
 
 
