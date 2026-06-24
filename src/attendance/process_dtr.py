@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -19,13 +20,46 @@ def load_dtr(input_path: Path) -> pd.DataFrame:
     return df
 
 
+def parse_dtr_datetime(date_value, time_value):
+    if pd.isna(date_value) or pd.isna(time_value):
+        return pd.NaT
+
+    date_part = pd.to_datetime(date_value, errors="coerce")
+    if pd.isna(date_part):
+        return pd.NaT
+    date_part = date_part.date()
+
+    if isinstance(time_value, time):
+        time_part = time_value
+    elif isinstance(time_value, datetime):
+        time_part = time_value.time()
+    elif isinstance(time_value, pd.Timestamp):
+        time_part = time_value.time()
+    elif isinstance(time_value, (int, float)):
+        seconds = round(float(time_value) * 86400) % 86400
+        time_part = (datetime.min + timedelta(seconds=seconds)).time()
+    else:
+        text_value = str(time_value).strip()
+        if text_value.lower() in {"", "nan", "nat", "none", "null"}:
+            return pd.NaT
+        parsed_time = pd.to_datetime(text_value, errors="coerce")
+        if pd.isna(parsed_time):
+            return pd.NaT
+        time_part = parsed_time.time()
+
+    return pd.Timestamp(datetime.combine(date_part, time_part))
+
+
 def clean_raw_logs(df: pd.DataFrame) -> pd.DataFrame:
     raw = df.copy()
     raw["EMPLOYEE CODE"] = raw["EMPLOYEE CODE"].astype(str).str.strip()
     raw["EMPLOYEE NAME"] = raw["EMPLOYEE NAME"].astype(str).str.strip()
     raw["DATE"] = pd.to_datetime(raw["DATE"], errors="coerce").dt.date
-    raw["TIME IN"] = pd.to_datetime(raw["TIME IN"], errors="coerce")
-    raw["TIME OUT"] = pd.to_datetime(raw["TIME OUT"], errors="coerce")
+
+    original_dates = df["DATE"]
+    raw["TIME IN"] = [parse_dtr_datetime(date_value, time_value) for date_value, time_value in zip(original_dates, df["TIME IN"])]
+    raw["TIME OUT"] = [parse_dtr_datetime(date_value, time_value) for date_value, time_value in zip(original_dates, df["TIME OUT"])]
+
     return raw.dropna(subset=["EMPLOYEE CODE", "DATE"])
 
 
